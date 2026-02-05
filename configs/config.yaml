@@ -1,0 +1,220 @@
+"""
+Configuration for Mechanistic Interpretability Typographic Transformer
+
+Design Principles:
+1. NO information bottlenecks (no VAE)
+2. Uniform architecture (patches, not CNN)
+3. Simple conditioning (prepend tokens)
+4. Spatial decoding (no pooling)
+5. Maximum observability (hooks everywhere)
+"""
+
+# Data Configuration
+data:
+  # Fonts
+  num_fonts: 500  # Scale up to 500-2000 for richer experiments
+  min_fonts: 200  # Minimum to proceed
+  
+  # Characters and sequences
+  characters: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+  
+  # Multi-character sequences for kerning analysis
+  use_sequences: true
+  max_sequence_length: 3  # 1, 2, or 3 characters
+  common_bigrams : ["Th","th","he","He","in","er","an","re","on","at","en","nd","of","to","is","it","as","or","be","by","we","us","if","so","ha","ou","ea","ng","al","ti","se","ar","le","ri","ro","ic","ne","me","co","de","hi","ra","la","ma","na","ta","sa","da","st","nt","ed","es","te","et","io","fo","rs","ll","ss","tt","ch","sh","wh","ph","ck","gh","ng","qu","tr","cr","br","dr","gr","fr","pr","pl","cl","fl","sl","bl","gl","sp","sk","sc","sm","sn","sw","ea","ee","ei","eo","eu","ai","au","ia","ie","oa","oe","oi","oo","ou","ua","ue","ui","rt","lt","ct","pt","xt","mp","rk","rm","rn","rs","ld","lk","qw","we","er","rt","ty","yu","ui","io","op","as","sd","df","fg","gh","hj","jk","kl","zx","xc","cv","vb","bn","nm","kn","wr","ps","mn","rh","tm","dg","bt","fp","gm"]
+  common_trigrams : ["the","and","ing","ion","ent","her","tha","nth","was","eth","for","dth","hat","his","ter","ate","all","ith","oth","ver","thi","tio","rea","nde","ers","ess","not","are","you","but","had","one","our","out","who","were","has","him","its","any","can","may","use","man","new","now","two","how","way","day","get","see","own","old","say","she","did","let","put","end","why","try","ask","far","off","run","pay","big","law","war","car","job","kid","dog","cat","sun","win","hot","low","red","mix","map","net","web","app","sys","dev","api","log","bug","cpu","ram","mem","gui","cli","sql","xml","txt","bin","hex","ack","ash","ain","amp","ank","ard","ask","awk","bad","bag","com","con","col","cor","res","ret","rev","sup","sur","syn"]
+
+  
+  # Rendering
+  image_size: 128  # Larger for multi-char sequences
+  font_size: 48
+  dpi: 100
+  
+  # Data splits (more fonts = larger splits)
+  train_ratio: 0.70
+  val_ratio: 0.10
+  test_ratio: 0.10
+  continual_ratio: 0.10
+  
+  # Paths
+  cache_dir: "./data/cache"
+  rendered_dir: "./data/rendered"
+
+# Model Architecture - PURE TRANSFORMER
+model:
+  # Vocabulary
+  char_vocab_size: 53  # A-Z, a-z
+  max_seq_len: 3  # Maximum character sequence length
+  
+  # Character embedding - LEARNED (simple and effective)
+  char_embed_dim: 128
+  use_learned_char_emb: true  # Learned embeddings work well
+  
+  # Font embedding - LEARNED with high capacity
+  font_embed_dim: 128
+  num_fonts: 500  # Will be set dynamically based on data
+  
+  # Optional: Disentangled font attributes (can be added via auxiliary loss)
+  use_font_attributes: true  # Use metadata as auxiliary supervision
+  font_attr_dim: 8  # serif, weight, width, slant, contrast, x-height, stroke-contrast, roundness
+  
+  # Image tokenization - PATCH EMBEDDINGS (uniform architecture)
+  patch_encoder:
+    patch_size: 16  # 128/16 = 8x8 = 64 spatial tokens
+    in_channels: 1
+    embed_dim: 512
+    
+  # Transformer - PURE, NO CROSS-ATTENTION
+  transformer:
+    num_layers: 8  # Deeper for better feature learning
+    num_heads: 8
+    dim: 512
+    mlp_ratio: 4
+    dropout: 0.1
+    attention_dropout: 0.1
+    
+    # Mechanistic interp optimizations
+    use_rmsnorm: true
+    use_swiglu: true
+    use_rotary_emb: true
+    
+    # NO cross-attention - use prepended tokens instead
+    conditioning_mode: "prepend"  # [font_tok, char_tok_1, ..., char_tok_N, patch_1, ..., patch_64]
+    
+  # Decoder - SPATIAL (no pooling)
+  decoder:
+    type: "spatial_cnn"  # Uses all spatial tokens
+    hidden_dims: [256, 128, 64]
+    output_channels: 1
+    
+  # NO VAE - direct reconstruction only
+  use_vae: false
+
+# Training Configuration
+training:
+  # Loss functions (NO contrastive)
+  loss_weights:
+    reconstruction: 1.0
+    perceptual: 0.5  # LPIPS for quality
+    font_attr_prediction: 0.1  # Auxiliary task to learn font features
+    
+  # Optimization
+  batch_size: 32
+  num_epochs: 150
+  learning_rate: 3e-4
+  weight_decay: 0.01
+  warmup_steps: 2000
+  scheduler: "cosine"
+  
+  # Gradient
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  
+  # Mixed precision
+  use_amp: true
+  
+  # Checkpointing
+  save_every: 10
+  eval_every: 5
+  log_every: 100
+
+# Mechanistic Interpretability Configuration
+interp:
+  # Activation saving
+  save_activations: true
+  save_every_n_batches: 50
+  max_activations_cache: 5000
+  
+  # Layers to analyze (all layers for comprehensive analysis)
+  layers_to_probe: [0, 1, 2, 3, 4, 5, 6, 7]
+  
+  # Probe targets
+  probe_targets:
+    # Character-level
+    - character_identity      # 52-way classification
+    - uppercase_vs_lowercase  # Binary
+    - vowel_vs_consonant     # Binary
+    
+    # Font-level  
+    - serif_vs_sans          # Binary
+    - weight_category        # Light/Regular/Bold (3-way)
+    - slant_category         # Normal/Italic (2-way)
+    - width_category         # Condensed/Normal/Wide (3-way)
+    
+    # Sequence-level (for multi-char)
+    - sequence_length        # 1/2/3 characters
+    - has_kerning_pair      # Whether characters need kerning
+    
+  # Attention analysis
+  attention:
+    log_patterns: true
+    log_every: 500
+    analyze_all_heads: true
+    
+    # Specific analyses
+    compute_attention_entropy: true
+    detect_attention_sinks: true
+    track_token_importance: true
+    
+  # Intervention experiments
+  interventions:
+    activation_patching:
+      enabled: true
+      patch_positions: [0, 1]  # Font and char tokens
+      patch_layers: [0, 2, 4, 6]
+      
+    attention_knockout:
+      enabled: true
+      test_heads: [0, 1, 2, 3, 4, 5, 6, 7]
+      
+    path_patching:
+      enabled: true
+      
+  # Representation analysis
+  cka:
+    enabled: true
+    compare_layers: true
+    compare_conditions: true  # e.g., serif vs sans
+    
+  # Sparse Autoencoders (for finding features)
+  sparse_autoencoder:
+    enabled: true
+    sparsity_penalty: 0.01
+    hidden_multiplier: 8
+    train_after_epoch: 50  # Train SAE after model converges
+
+# Continual Learning (Phase 4)
+continual:
+  enabled: false
+  
+  # Method to use
+  method: "lora"  # Most compatible with mech interp
+  
+  lora:
+    rank: 16
+    alpha: 32
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+    
+  # Track metrics
+  track_forgetting: true
+  track_weight_changes: true
+  track_feature_drift: true
+
+# Logging
+logging:
+  use_wandb: true
+  project_name: "typo-mech-interp"
+  
+  # What to log
+  log_gradients: false
+  log_weights: false
+  log_attention_maps: true
+  log_activations_summary: true
+  
+  # Visualization
+  visualize_every: 1000
+  num_samples_to_visualize: 8
+
+# Reproducibility
+seed: 42
+deterministic: true
