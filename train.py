@@ -23,7 +23,7 @@ from contextlib import nullcontext
 
 # Import project modules - FIXED imports
 from typo_transformer import TypographicTransformer
-from dataset import TypographicDataset, collate_fn, load_dataset_split
+from dataset import LazyTypographicDataset, collate_fn_optimized, load_dataset_split
 from losses import CombinedLoss
 
 logging.basicConfig(level=logging.INFO)
@@ -280,8 +280,12 @@ class Trainer:
                 # Forward pass with mixed precision
                 if self.use_amp:
                     with autocast():
+                        if torch.rand(1).item() < 0.20: # 20% chance to hide the image
+                            images_input = torch.zeros_like(images)
+                        else:
+                            images_input = images
                         output = self.model(
-                            image=images,
+                            image=images_input,
                             char_indices=char_indices,
                             font_idx=font_idx
                         )
@@ -296,8 +300,12 @@ class Trainer:
                         
                         loss = losses['total'] / self.grad_accum_steps
                 else:
+                    if torch.rand(1).item() < 0.20: # 20% chance to hide the image
+                        images_input = torch.zeros_like(images)
+                    else:
+                        images_input = images
                     output = self.model(
-                        image=images,
+                        image=images_input,
                         char_indices=char_indices,
                         font_idx=font_idx
                     )
@@ -643,12 +651,12 @@ def main():
     logger.info(f"Total unique fonts: {len(all_fonts)}")
     
     # Create datasets
-    train_dataset = TypographicDataset(
+    train_dataset = LazyTypographicDataset(
         train_fonts,
         characters=config['data']['characters']
     )
     
-    val_dataset = TypographicDataset(
+    val_dataset = LazyTypographicDataset(
         val_fonts,
         characters=config['data']['characters']
     )
@@ -659,7 +667,7 @@ def main():
         batch_size=config['training']['batch_size'],
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=collate_fn,
+        collate_fn=collate_fn_optimized,
         pin_memory=True,
         prefetch_factor=4 if args.num_workers > 0 else None,
         persistent_workers=False,  # Don't waste memory on Colab
@@ -671,7 +679,7 @@ def main():
         batch_size=config['training']['batch_size'],
         shuffle=False,
         num_workers=args.num_workers,
-        collate_fn=collate_fn,
+        collate_fn=collate_fn_optimized,
         pin_memory=True,
         prefetch_factor=4 if args.num_workers > 0 else None,
         persistent_workers=False,
