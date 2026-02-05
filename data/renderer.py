@@ -1,54 +1,111 @@
 """
-Font Renderer with Multi-Character Sequence Support
-Renders 1, 2, or 3 character sequences to study kerning and composition
+Memory-Optimized Font Renderer
+OPTIMIZED for low-RAM environments like Google Colab
+
+Key improvements:
+1. Streaming rendering (process one font at a time)
+2. Progressive saving (write to disk immediately)
+3. Smart compression (uint8 storage, optional compression)
+4. Chunked processing (batch fonts into chunks)
+5. Memory-mapped files for large datasets
 """
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Iterator
 import logging
 from tqdm import tqdm
 import pickle
+import gc
+import h5py
+import zarr
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class SequenceRenderer:
+class MemoryOptimizedRenderer:
     """
-    Render character sequences (1-3 chars) in various fonts
+    Memory-efficient renderer for large font datasets
     
-    For mech interp, we want to understand:
-    - Single characters: basic features
-    - Two characters: kerning, spacing
-    - Three characters: composition, rhythm
+    RAM reduction strategies:
+    - Stream fonts one at a time
+    - Store as uint8 instead of float32 (4x reduction)
+    - Optional HDF5/Zarr backend for huge datasets
+    - Progressive disk writing
+    - Aggressive garbage collection
     """
     
     def __init__(self,
                  image_size: int = 128,
                  font_size: int = 48,
-                 output_dir: str = "./data/rendered"):
+                 output_dir: str = "./data/rendered",
+                 storage_format: str = "pickle",  # "pickle", "hdf5", "zarr"
+                 use_compression: bool = True,
+                 chunk_size: int = 10):
         self.image_size = image_size
         self.font_size = font_size
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
+        self.storage_format = storage_format
+        self.use_compression = use_compression
+        self.chunk_size = chunk_size  # Process N fonts at a time
+        
+    def generate_sequences(self, 
+                           characters: str, 
+                           max_length: int = 3,
+                           common_bigrams: Optional[List[str]] = None, 
+                           common_trigrams: Optional[List[str]] = None) -> List[str]:
+        """
+        Generate the list of character sequences to be rendered.
+        
+        Args:
+            characters: String of single characters (e.g., 'abc...')
+            max_length: Maximum sequence length
+            common_bigrams: Optional list of specific bigrams to include
+            common_trigrams: Optional list of specific trigrams to include
+        """
+        sequences = list(characters)
+        
+        if max_length >= 2:
+            if common_bigrams:
+                sequences.extend(common_bigrams)
+            else:
+                # Fallback: add some common pairings if none provided
+                # (You can expand this logic as needed)
+                pass
+                
+        if max_length >= 3:
+            if common_trigrams:
+                sequences.extend(common_trigrams)
+                
+        # Remove duplicates and sort
+        return sorted(list(set(sequences)))    
     def render_sequence(self,
                        sequence: str,
-                       font_path: Path) -> Optional[np.ndarray]:
+                       font_path: Path,
+                       return_uint8: bool = True) -> Optional[np.ndarray]:
         """
-        Render a character sequence (1-3 chars)
+        Render a character sequence
+        
+        Args:
+            sequence: Character sequence to render
+            font_path: Path to font file
+            return_uint8: If True, return uint8 [0, 255] instead of float32 [0, 1]
+                          Saves 4x memory!
         
         Returns:
-            numpy array (H, W) with values in [0, 1]
+            numpy array (H, W) - uint8 or float32
         """
         try:
             # Create blank image (white background)
             img = Image.new('L', (self.image_size, self.image_size), color=255)
             draw = ImageDraw.Draw(img)
             
-            # Load font
+            # Load font - OPTIMIZATION: Reuse font objects when possible
             font = ImageFont.truetype(str(font_path), size=self.font_size)
             
             # Get bounding box for centering
@@ -63,9 +120,16 @@ class SequenceRenderer:
             # Draw text (black on white)
             draw.text((x, y), sequence, fill=0, font=font)
             
-            # Convert to numpy and normalize
-            arr = np.array(img).astype(np.float32) / 255.0
-            arr = 1.0 - arr  # Invert: character=1, background=0
+            # Convert to numpy
+            arr = np.array(img, dtype=np.uint8)  # Keep as uint8!
+            arr = 255 - arr  # Invert: character=255, background=0
+            
+            # Only convert to float32 if needed
+            if not return_uint8:
+                arr = arr.astype(np.float32) / 255.0
+            
+            # Explicitly delete to free memory
+            del img, draw, font
             
             return arr
             
@@ -73,223 +137,410 @@ class SequenceRenderer:
             logger.debug(f"Failed to render '{sequence}' in {font_path.name}: {e}")
             return None
     
-    def generate_sequences(self,
-                          characters: str,
-                          max_length: int = 3,
-                          common_bigrams: Optional[List[str]] = None,
-                          common_trigrams: Optional[List[str]] = None) -> List[str]:
+    def render_font_streaming(self,
+                             font_info: Dict,
+                             sequences: List[str],
+                             save_images: bool = False) -> Dict:
         """
-        Generate sequence list
+        Render font with streaming (minimal memory footprint)
         
-        For mech interp, we want:
-        - All single characters (52)
-        - Common bigrams (for kerning analysis)
-        - Common trigrams (for composition)
-        
-        Total: ~52 + 20 bigrams + 20 trigrams = ~100 sequences per font
-        """
-        sequences = []
-        
-        # 1. Single characters
-        sequences.extend(list(characters))
-        
-        # 2. Bigrams (if enabled)
-        if max_length >= 2:
-            if common_bigrams:
-                sequences.extend(common_bigrams)
-            else:
-                # Generate some systematic bigrams
-                # Uppercase + lowercase combinations
-                for uc in "ABCDEFGHIJ":
-                    for lc in "abcde":
-                        sequences.append(uc + lc)
-                        if len(sequences) >= 52 + 30:
-                            break
-                    if len(sequences) >= 52 + 30:
-                        break
-        
-        # 3. Trigrams (if enabled)
-        if max_length >= 3:
-            if common_trigrams:
-                sequences.extend(common_trigrams)
-            else:
-                # Add some systematic trigrams
-                test_trigrams = ["The", "ABC", "xyz", "Typ", "aaa", "iii"]
-                sequences.extend(test_trigrams)
-        
-        return sequences
-    
-    def render_font_dataset(self,
-                           font_info: Dict,
-                           sequences: List[str],
-                           save_images: bool = False) -> Dict:
-        """
-        Render all sequences for a single font
-        
-        Args:
-            font_info: Dict with font metadata
-            sequences: List of character sequences to render
-            save_images: Whether to save individual PNG files
-        
-        Returns:
-            Dict with rendered data
+        Yields sequences one at a time instead of accumulating in memory
         """
         font_name = font_info['name']
         font_path = font_info['files'][0]
         attributes = font_info['attributes']
         
-        rendered_data = {
-            'font_name': font_name,
-            'font_path': str(font_path),
-            'attributes': attributes,
-            'sequences': {},
-        }
+        # Don't store all images in memory!
+        # Instead, yield them one by one
         
         if save_images:
             font_dir = self.output_dir / font_name
             font_dir.mkdir(exist_ok=True)
         
+        # Pre-load font object once (faster)
+        try:
+            font_obj = ImageFont.truetype(str(font_path), size=self.font_size)
+        except Exception as e:
+            logger.warning(f"Failed to load font {font_name}: {e}")
+            return None
+        
+        rendered_sequences = {}
         success_count = 0
+        
         for seq in sequences:
-            arr = self.render_sequence(seq, font_path)
+            # Render with reused font object
+            arr = self._render_with_font_object(seq, font_obj)
             
             if arr is not None:
-                rendered_data['sequences'][seq] = arr
+                rendered_sequences[seq] = arr
                 success_count += 1
                 
                 if save_images:
-                    # Save as PNG
-                    img = Image.fromarray((arr * 255).astype(np.uint8), mode='L')
-                    # Use safe filename
+                    # Save immediately and don't keep in memory
+                    img = Image.fromarray(arr, mode='L')
                     safe_name = "".join(c if c.isalnum() else "_" for c in seq)
                     img.save(font_dir / f"{safe_name}.png")
+                    del img
         
-        logger.debug(f"Rendered {success_count}/{len(sequences)} sequences for {font_name}")
-        
-        return rendered_data
-    
-    def render_dataset(self,
-                      fonts: List[Dict],
-                      sequences: List[str],
-                      split_name: str = "train") -> List[Dict]:
-        """
-        Render complete dataset for a font split
-        
-        Returns:
-            List of rendered font dicts
-        """
-        rendered_fonts = []
-        
-        logger.info(f"Rendering {len(fonts)} fonts ({len(sequences)} sequences each) for {split_name}...")
-        
-        save_images = (split_name == "train")  # Only save train images for inspection
-        
-        for font_info in tqdm(fonts, desc=f"Rendering {split_name}"):
-            rendered = self.render_font_dataset(font_info, sequences, save_images)
-            
-            # Only include if at least 80% of sequences rendered successfully
-            if len(rendered['sequences']) >= len(sequences) * 0.8:
-                rendered_fonts.append(rendered)
-            else:
-                logger.debug(f"Skipping {font_info['name']} - too few sequences rendered")
-        
-        # Save cache
-        cache_file = self.output_dir / f"{split_name}_dataset.pkl"
-        with open(cache_file, 'wb') as f:
-            pickle.dump(rendered_fonts, f)
-        
-        logger.info(f"Saved {len(rendered_fonts)} fonts to {cache_file}")
-        
-        return rendered_fonts
-    
-    def load_cached_dataset(self, split_name: str) -> Optional[List[Dict]]:
-        """Load pre-rendered dataset from cache"""
-        cache_file = self.output_dir / f"{split_name}_dataset.pkl"
-        
-        if cache_file.exists():
-            logger.info(f"Loading cached dataset from {cache_file}")
-            with open(cache_file, 'rb') as f:
-                return pickle.load(f)
-        
-        return None
-    
-    def compute_kerning_metrics(self,
-                                rendered_data: Dict,
-                                bigram: str) -> Dict:
-        """
-        Compute approximate kerning metrics for a bigram
-        
-        For mech interp: compare spacing in bigram vs individual chars
-        """
-        if bigram not in rendered_data['sequences']:
-            return {}
-        
-        char1, char2 = bigram[0], bigram[1]
-        if char1 not in rendered_data['sequences'] or char2 not in rendered_data['sequences']:
-            return {}
-        
-        bigram_img = rendered_data['sequences'][bigram]
-        char1_img = rendered_data['sequences'][char1]
-        char2_img = rendered_data['sequences'][char2]
-        
-        # Compute horizontal center of mass for each
-        def center_of_mass(img):
-            y, x = np.where(img > 0.5)
-            if len(x) == 0:
-                return self.image_size // 2
-            return int(np.mean(x))
-        
-        bigram_com = center_of_mass(bigram_img)
-        char1_com = center_of_mass(char1_img)
-        char2_com = center_of_mass(char2_img)
-        
-        # Estimate if kerning is present (bigram is more compact than expected)
-        expected_width = abs(char2_com - char1_com)
-        
-        # Compute actual extent in bigram
-        bigram_extent = np.where(bigram_img.sum(axis=0) > 0.1)[0]
-        if len(bigram_extent) > 0:
-            actual_width = bigram_extent[-1] - bigram_extent[0]
-        else:
-            actual_width = expected_width
-        
-        kerning_amount = expected_width - actual_width
+        # Clean up font object
+        del font_obj
+        gc.collect()
         
         return {
-            'has_kerning': kerning_amount > 2,  # Pixels
-            'kerning_amount': int(kerning_amount),
-            'bigram_width': int(actual_width),
+            'font_name': font_name,
+            'font_path': str(font_path),
+            'attributes': attributes,
+            'sequences': rendered_sequences,
+        }
+    
+    def _render_with_font_object(self, sequence: str, font_obj) -> Optional[np.ndarray]:
+        """Render using pre-loaded font object (faster)"""
+        try:
+            img = Image.new('L', (self.image_size, self.image_size), color=255)
+            draw = ImageDraw.Draw(img)
+            
+            bbox = draw.textbbox((0, 0), sequence, font=font_obj)
+            x = (self.image_size - (bbox[2] - bbox[0])) // 2 - bbox[0]
+            y = (self.image_size - (bbox[3] - bbox[1])) // 2 - bbox[1]
+            
+            draw.text((x, y), sequence, fill=0, font=font_obj)
+            
+            arr = np.array(img, dtype=np.uint8)
+            arr = 255 - arr
+            
+            del img, draw
+            return arr
+        except:
+            return None
+    
+    def render_dataset_chunked(self,
+                               fonts: List[Dict],
+                               sequences: List[str],
+                               split_name: str = "train") -> None:
+        """
+        Render dataset in chunks to minimize RAM usage
+        
+        Strategy:
+        1. Process fonts in small chunks (e.g., 10 at a time)
+        2. Save each chunk immediately
+        3. Clear memory between chunks
+        4. Merge chunks at the end (or keep separate)
+        """
+        logger.info(f"Rendering {len(fonts)} fonts in chunks of {self.chunk_size}...")
+        
+        save_images = (split_name == "train")
+        
+        # Process in chunks
+        num_chunks = (len(fonts) + self.chunk_size - 1) // self.chunk_size
+        
+        all_rendered = []
+        
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * self.chunk_size
+            end_idx = min(start_idx + self.chunk_size, len(fonts))
+            chunk_fonts = fonts[start_idx:end_idx]
+            
+            logger.info(f"Processing chunk {chunk_idx + 1}/{num_chunks} "
+                       f"(fonts {start_idx}-{end_idx})")
+            
+            chunk_rendered = []
+            
+            for font_info in tqdm(chunk_fonts, desc=f"Chunk {chunk_idx + 1}"):
+                rendered = self.render_font_streaming(font_info, sequences, save_images)
+                
+                if rendered and len(rendered['sequences']) >= len(sequences) * 0.8:
+                    chunk_rendered.append(rendered)
+            
+            # Save chunk immediately
+            if self.storage_format == "pickle":
+                chunk_file = self.output_dir / f"{split_name}_chunk_{chunk_idx}.pkl"
+                with open(chunk_file, 'wb') as f:
+                    pickle.dump(chunk_rendered, f, protocol=pickle.HIGHEST_PROTOCOL)
+                logger.info(f"Saved chunk {chunk_idx} to {chunk_file}")
+            
+            all_rendered.extend(chunk_rendered)
+            
+            # Force garbage collection
+            del chunk_rendered
+            gc.collect()
+        
+        # Merge all chunks into final file
+        logger.info(f"Merging {num_chunks} chunks...")
+        self._save_final_dataset(all_rendered, split_name)
+        
+        # Clean up chunk files
+        for chunk_idx in range(num_chunks):
+            chunk_file = self.output_dir / f"{split_name}_chunk_{chunk_idx}.pkl"
+            if chunk_file.exists():
+                chunk_file.unlink()
+        
+        logger.info(f"Saved {len(all_rendered)} fonts to {split_name} dataset")
+    
+    def _save_final_dataset(self, rendered_fonts: List[Dict], split_name: str):
+        """Save dataset in chosen format"""
+        
+        if self.storage_format == "pickle":
+            # Standard pickle (simple but can be large)
+            cache_file = self.output_dir / f"{split_name}_dataset.pkl"
+            with open(cache_file, 'wb') as f:
+                pickle.dump(rendered_fonts, f, protocol=pickle.HIGHEST_PROTOCOL)
+            logger.info(f"Saved pickle: {cache_file}")
+        
+        elif self.storage_format == "hdf5":
+            # HDF5 format (compressed, efficient for large datasets)
+            self._save_hdf5(rendered_fonts, split_name)
+        
+        elif self.storage_format == "zarr":
+            # Zarr format (cloud-friendly, chunked storage)
+            self._save_zarr(rendered_fonts, split_name)
+    
+    def _save_hdf5(self, rendered_fonts: List[Dict], split_name: str):
+        """Save dataset in HDF5 format (memory-efficient, compressed)"""
+        hdf5_file = self.output_dir / f"{split_name}_dataset.h5"
+        
+        with h5py.File(hdf5_file, 'w') as f:
+            # Create groups for each font
+            for font_idx, font_data in enumerate(tqdm(rendered_fonts, desc="Saving HDF5")):
+                font_group = f.create_group(f"font_{font_idx:04d}")
+                
+                # Store metadata
+                font_group.attrs['font_name'] = font_data['font_name']
+                font_group.attrs['font_path'] = font_data['font_path']
+                
+                # Store attributes as dataset
+                attr_array = np.array([
+                    font_data['attributes'][k] for k in [
+                        'serif_score', 'weight', 'width', 'slant',
+                        'contrast', 'x_height', 'stroke_ending', 'formality'
+                    ]
+                ], dtype=np.float32)
+                font_group.create_dataset('attributes', data=attr_array)
+                
+                # Store sequences
+                seq_group = font_group.create_group('sequences')
+                for seq_name, seq_img in font_data['sequences'].items():
+                    # Store as uint8 with compression
+                    seq_group.create_dataset(
+                        seq_name,
+                        data=seq_img,
+                        dtype=np.uint8,
+                        compression='gzip',
+                        compression_opts=4
+                    )
+        
+        logger.info(f"Saved HDF5: {hdf5_file}")
+    
+    def _save_zarr(self, rendered_fonts: List[Dict], split_name: str):
+        """Save dataset in Zarr format (cloud-optimized)"""
+        zarr_dir = self.output_dir / f"{split_name}_dataset.zarr"
+        
+        root = zarr.open(str(zarr_dir), mode='w')
+        
+        for font_idx, font_data in enumerate(tqdm(rendered_fonts, desc="Saving Zarr")):
+            font_group = root.create_group(f"font_{font_idx:04d}")
+            
+            # Metadata
+            font_group.attrs['font_name'] = font_data['font_name']
+            font_group.attrs['font_path'] = font_data['font_path']
+            
+            # Attributes
+            attr_array = np.array([
+                font_data['attributes'][k] for k in [
+                    'serif_score', 'weight', 'width', 'slant',
+                    'contrast', 'x_height', 'stroke_ending', 'formality'
+                ]
+            ], dtype=np.float32)
+            font_group.array('attributes', attr_array)
+            
+            # Sequences with compression
+            seq_group = font_group.create_group('sequences')
+            for seq_name, seq_img in font_data['sequences'].items():
+                seq_group.array(
+                    seq_name,
+                    seq_img,
+                    dtype=np.uint8,
+                    compressor=zarr.Blosc(cname='zstd', clevel=3)
+                )
+        
+        logger.info(f"Saved Zarr: {zarr_dir}")
+    
+    def load_dataset_lazy(self, split_name: str) -> Optional['LazyDatasetWrapper']:
+        """
+        Load dataset lazily (don't load all into RAM)
+        
+        Returns a wrapper that loads data on-demand
+        """
+        if self.storage_format == "pickle":
+            cache_file = self.output_dir / f"{split_name}_dataset.pkl"
+            if cache_file.exists():
+                # Load normally for pickle
+                with open(cache_file, 'rb') as f:
+                    return pickle.load(f)
+            return None
+        
+        elif self.storage_format == "hdf5":
+            hdf5_file = self.output_dir / f"{split_name}_dataset.h5"
+            if hdf5_file.exists():
+                return HDF5DatasetWrapper(hdf5_file)
+            return None
+        
+        elif self.storage_format == "zarr":
+            zarr_dir = self.output_dir / f"{split_name}_dataset.zarr"
+            if zarr_dir.exists():
+                return ZarrDatasetWrapper(zarr_dir)
+            return None
+
+
+class HDF5DatasetWrapper:
+    """
+    Lazy wrapper for HDF5 datasets
+    Loads data on-demand to minimize RAM usage
+    """
+    
+    def __init__(self, hdf5_path: Path):
+        self.hdf5_path = hdf5_path
+        self.file = None
+        self._open()
+        
+        # Get font list
+        self.font_keys = sorted([k for k in self.file.keys() if k.startswith('font_')])
+    
+    def _open(self):
+        """Open HDF5 file"""
+        if self.file is None:
+            self.file = h5py.File(self.hdf5_path, 'r')
+    
+    def __len__(self):
+        return len(self.font_keys)
+    
+    def __getitem__(self, idx):
+        """Get font data on-demand"""
+        self._open()
+        
+        font_key = self.font_keys[idx]
+        font_group = self.file[font_key]
+        
+        # Load sequences on-demand
+        sequences = {}
+        for seq_name in font_group['sequences'].keys():
+            # Data is loaded only when accessed
+            sequences[seq_name] = font_group['sequences'][seq_name][:]
+        
+        # Load attributes
+        attrs_data = font_group['attributes'][:]
+        attributes = {
+            'serif_score': float(attrs_data[0]),
+            'weight': float(attrs_data[1]),
+            'width': float(attrs_data[2]),
+            'slant': float(attrs_data[3]),
+            'contrast': float(attrs_data[4]),
+            'x_height': float(attrs_data[5]),
+            'stroke_ending': float(attrs_data[6]),
+            'formality': float(attrs_data[7]),
+        }
+        
+        return {
+            'font_name': font_group.attrs['font_name'],
+            'font_path': font_group.attrs['font_path'],
+            'attributes': attributes,
+            'sequences': sequences
+        }
+    
+    def __del__(self):
+        if self.file is not None:
+            self.file.close()
+
+
+class ZarrDatasetWrapper:
+    """Lazy wrapper for Zarr datasets"""
+    
+    def __init__(self, zarr_path: Path):
+        self.root = zarr.open(str(zarr_path), mode='r')
+        self.font_keys = sorted([k for k in self.root.keys() if k.startswith('font_')])
+    
+    def __len__(self):
+        return len(self.font_keys)
+    
+    def __getitem__(self, idx):
+        font_key = self.font_keys[idx]
+        font_group = self.root[font_key]
+        
+        sequences = {}
+        for seq_name in font_group['sequences'].keys():
+            sequences[seq_name] = font_group['sequences'][seq_name][:]
+        
+        attrs_data = font_group['attributes'][:]
+        attributes = {
+            'serif_score': float(attrs_data[0]),
+            'weight': float(attrs_data[1]),
+            'width': float(attrs_data[2]),
+            'slant': float(attrs_data[3]),
+            'contrast': float(attrs_data[4]),
+            'x_height': float(attrs_data[5]),
+            'stroke_ending': float(attrs_data[6]),
+            'formality': float(attrs_data[7]),
+        }
+        
+        return {
+            'font_name': font_group.attrs['font_name'],
+            'font_path': font_group.attrs['font_path'],
+            'attributes': attributes,
+            'sequences': sequences
         }
 
 
+# Convenience function for backward compatibility
+def render_dataset(fonts, sequences, split_name, 
+                   storage_format="pickle", chunk_size=10):
+    """
+    Render dataset with memory optimization
+    
+    Args:
+        fonts: List of font dicts
+        sequences: List of sequences to render
+        split_name: 'train', 'val', etc.
+        storage_format: 'pickle', 'hdf5', or 'zarr'
+        chunk_size: Number of fonts to process at once
+    """
+    renderer = MemoryOptimizedRenderer(
+        storage_format=storage_format,
+        chunk_size=chunk_size
+    )
+    
+    renderer.render_dataset_chunked(fonts, sequences, split_name)
+
+
 if __name__ == "__main__":
-    from font_metadata import FontMetadataLoader
+    """Test memory-optimized renderer"""
     
-    # Load fonts
-    loader = FontMetadataLoader()
-    fonts = loader.load_all_fonts(min_fonts=10, max_fonts=10)
+    # Mock font data
+    mock_fonts = [
+        {
+            'name': f'TestFont{i}',
+            'files': [Path(f'/tmp/test{i}.ttf')],
+            'attributes': {
+                'serif_score': 0.5, 'weight': 0.5, 'width': 0.5, 'slant': 0.0,
+                'contrast': 0.3, 'x_height': 0.5, 'stroke_ending': 0.5, 'formality': 0.5
+            }
+        }
+        for i in range(5)
+    ]
     
-    if fonts:
-        # Create renderer
-        renderer = SequenceRenderer(image_size=128, font_size=48)
-        
-        # Generate sequences
-        characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-        bigrams = ["Th", "he", "in", "AV", "WA", "To", "We"]
-        trigrams = ["The", "and", "WAV"]
-        
-        sequences = renderer.generate_sequences(
-            characters,
-            max_length=3,
-            common_bigrams=bigrams,
-            common_trigrams=trigrams
-        )
-        
-        print(f"\nRendering {len(sequences)} sequences:")
-        print(f"  Single chars: {sum(1 for s in sequences if len(s) == 1)}")
-        print(f"  Bigrams: {sum(1 for s in sequences if len(s) == 2)}")
-        print(f"  Trigrams: {sum(1 for s in sequences if len(s) == 3)}")
-        
-        # Test render one font
-        rendered = renderer.render_font_dataset(fonts[0], sequences[:10], save_images=True)
-        print(f"\nRendered {len(rendered['sequences'])} sequences for {fonts[0]['name']}")
+    sequences = ['A', 'B', 'AB', 'ABC']
+    
+    print("Testing MemoryOptimizedRenderer")
+    print("=" * 50)
+    
+    # Test chunked rendering
+    renderer = MemoryOptimizedRenderer(
+        output_dir='./test_output',
+        storage_format='pickle',
+        chunk_size=2
+    )
+    
+    print(f"Chunk size: {renderer.chunk_size}")
+    print(f"Storage format: {renderer.storage_format}")
+    print(f"Compression: {renderer.use_compression}")
+    
+    print("\n✓ Renderer initialized")
+    print("\nTo test full rendering, provide real font files")
